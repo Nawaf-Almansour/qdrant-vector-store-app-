@@ -10,6 +10,145 @@ Full-stack application for image similarity search using Qdrant vector database 
 - **Embeddings**: CLIP ViT-B/32 via Transformers.js (512-dim)
 - **Image Storage**: Local filesystem
 
+## How Qdrant Works — System Diagram
+
+### High-Level Flow
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         Frontend (React)                         │
+│                                                                  │
+│   ┌─────────────┐                    ┌─────────────────┐         │
+│   │ Upload Page  │                    │  Search Page     │        │
+│   │ (Index Image)│                    │ (Find Similar)   │        │
+│   └──────┬──────┘                    └────────┬────────┘         │
+└──────────┼────────────────────────────────────┼──────────────────┘
+           │ POST /api/v1/images/index          │ POST /api/v1/images/search
+           ▼                                    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                      Backend (NestJS)                             │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │                    Images Controller                         │ │
+│  └────────────────────────┬────────────────────────────────────┘ │
+│                           │                                      │
+│          ┌────────────────┼───────────────────┐                  │
+│          ▼                ▼                   ▼                  │
+│  ┌──────────────┐ ┌──────────────┐  ┌──────────────────┐        │
+│  │ Local Storage │ │ CLIP Model   │  │ Image Vector     │        │
+│  │ Service       │ │ (Embedding)  │  │ Repository       │        │
+│  │              │ │              │  │                  │        │
+│  │ Save image   │ │ Image → 512  │  │ Qdrant upsert / │        │
+│  │ to disk      │ │ dim vector   │  │ search / delete  │        │
+│  └──────┬───────┘ └──────┬───────┘  └────────┬─────────┘        │
+│         │                │                   │                  │
+│         ▼                │                   ▼                  │
+│  ┌──────────────┐        │          ┌──────────────────┐        │
+│  │ ./uploads/   │        │          │ Qdrant Client    │        │
+│  │ (filesystem) │        │          │ Service          │        │
+│  └──────────────┘        │          └────────┬─────────┘        │
+│                          │                   │                  │
+└──────────────────────────┼───────────────────┼──────────────────┘
+                           │                   │
+                           │                   ▼
+                           │          ┌──────────────────┐
+                           │          │   Qdrant DB      │
+                           │          │   (Docker)       │
+                           │          │   Port 6333      │
+                           │          └──────────────────┘
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │  Hugging Face    │
+                  │  Transformers.js │
+                  │  CLIP ViT-B/32   │
+                  └──────────────────┘
+```
+
+### Image Indexing Flow
+
+```
+  Image Upload                CLIP Embedding              Qdrant Storage
+  ───────────                 ──────────────              ──────────────
+       │                           │                           │
+  1. Validate image           3. Resize to                5. Upsert point:
+     (type, size)                224×224 px                   id: uuid
+       │                           │                          vector: [512 floats]
+  2. Save to                  4. Run through                  payload: {
+     ./uploads/{uuid}.jpg        CLIP vision model              business_id,
+       │                           │                              category,
+       │                      Output: 512-dim                     image_url,
+       │                      normalized vector                   filename,
+       │                           │                              created_at
+       │                           │                            }
+       ▼                           ▼                           ▼
+  ┌──────────┐            ┌──────────────┐           ┌──────────────┐
+  │ uploads/ │            │ [0.02, -0.1, │           │  Qdrant      │
+  │ {uuid}   │            │  0.05, ...]  │           │  Collection: │
+  │ .jpg     │            │  (512 dims)  │           │  image_      │
+  └──────────┘            └──────────────┘           │  vectors     │
+                                                     └──────────────┘
+```
+
+### Similarity Search Flow
+
+```
+  Query Image               Embedding                Search & Filter
+  ───────────               ─────────                ───────────────
+       │                        │                          │
+  1. Upload query          2. Generate 512-dim        3. Qdrant cosine
+     image                    CLIP vector                similarity search
+       │                        │                          │
+       │                        │                     4. Filter by:
+       │                        │                        - business_id (required)
+       │                        │                        - category (optional)
+       │                        │                        - status (optional)
+       │                        │                          │
+       ▼                        ▼                     5. Return top-K
+                                                         results with scores
+                                                          │
+                                                          ▼
+                                                    ┌────────────────┐
+                                                    │ Results:       │
+                                                    │ [{             │
+                                                    │   imageId,     │
+                                                    │   score: 0.95, │
+                                                    │   imageUrl,    │
+                                                    │   category     │
+                                                    │ }, ...]        │
+                                                    └────────────────┘
+```
+
+### How Qdrant Stores and Searches Vectors
+
+```
+  Qdrant Collection: "image_vectors"
+  ═══════════════════════════════════
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Point 1                                                │
+  │  id: "a1b2c3d4-..."                                     │
+  │  vector: [0.02, -0.11, 0.05, ..., 0.08]  (512 dims)   │
+  │  payload: { business_id: "biz_001",                     │
+  │             category: "product",                        │
+  │             image_url: "/uploads/a1b2c3d4-....jpg" }    │
+  ├─────────────────────────────────────────────────────────┤
+  │  Point 2                                                │
+  │  id: "e5f6g7h8-..."                                     │
+  │  vector: [0.15, 0.03, -0.07, ..., -0.12]  (512 dims)  │
+  │  payload: { business_id: "biz_001",                     │
+  │             category: "logo",                           │
+  │             image_url: "/uploads/e5f6g7h8-....png" }    │
+  ├─────────────────────────────────────────────────────────┤
+  │  Point N ...                                            │
+  └─────────────────────────────────────────────────────────┘
+
+  Search: cosine_similarity(query_vector, point.vector)
+  ═══════════════════════════════════════════════════════
+  Query vector ──►  Compare against ALL points  ──►  Rank by score
+                    (with payload filters)           Return top-K
+```
+
 ## Quick Start
 
 ### 1. Start Qdrant
@@ -50,4 +189,3 @@ Frontend runs on `http://localhost:5173`.
 ## Environment Variables
 
 See `.env.example` for all configuration options.
-# qdrant-vector-store-app-
